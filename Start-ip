@@ -1,0 +1,301 @@
+from pathlib import Path
+import time
+import random
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+from skimage.feature import hog, local_binary_pattern
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, ConfusionMatrixDisplay
+)
+
+# Configuracion del DATASET
+
+DATASET = Path(r"C:\Users\Usuario\OneDrive\Desktop\Universidad\Universidad\Vision\Entrega 3\VisionT3\screw_defect_detection_dataset")
+EXT_IMG = {".jpg", ".jpeg", ".png", ".bmp"}
+CLASES = [l.strip() for l in (DATASET / "classes.txt").read_text().splitlines() if l.strip()]
+idx_screw = CLASES.index("screw")
+IMG_SIZE = (128, 128)
+TOL_FRAC = 0.1
+
+def rutas(split):
+    carpeta = DATASET / "images" / split
+    imgs = sorted(p for p in carpeta.iterdir() if p.suffix.lower() in EXT_IMG)
+    return [(p, DATASET / "labels" / split / (p.stem + ".txt")) for p in imgs]
+
+
+def leer_etiquetas(txt_path, w, h):
+    out = []
+    texto = Path(txt_path).read_text().strip()
+    for linea in texto.splitlines():
+        v = linea.split()
+        if len(v) < 5:
+            continue
+        cls = int(v[0])
+        vals = np.array(v[1:], dtype=np.float32)
+        if len(vals) == 4:
+            cx, cy, bw, bh = vals
+            pts = np.array([
+                [cx - bw / 2, cy - bh / 2],
+                [cx + bw / 2, cy - bh / 2],
+                [cx + bw / 2, cy + bh / 2],
+                [cx - bw / 2, cy + bh / 2]
+            ], dtype=np.float32)
+        else:
+            pts = vals[: len(vals) // 2 * 2].reshape(-1, 2)
+        pts[:, 0] *= w
+        pts[:, 1] *= h
+        out.append((cls, pts.astype(np.int32)))
+    return out
+
+COLORES = {
+    "head_defect": (0, 0, 255), "neck_defect": (0, 165, 255), "screw": (0, 200, 0),
+    "thread_defect": (255, 0, 0), "tip_defect": (255, 0, 255)
+}
+
+def dibujar_identificacion(img_p, lbl_p):
+    img = cv2.imread(str(img_p))
+    h, w = img.shape[:2]
+    esc = max(h, w) / 1000
+    for cls, pts in leer_etiquetas(lbl_p, w, h):
+        nombre = CLASES[cls]
+        color = COLORES.get(nombre, (255, 255, 0))
+        cv2.polylines(img, [pts], True, color, max(2, int(3 * esc)))
+        x, y = int(pts[:, 0].min()), int(pts[:, 1].min())
+        cv2.putText(img, nombre, (x, max(y - 10, 25)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8 * esc, color, max(2, int(2 * esc)))
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+def mostrar_galeria_split(split, titulo, ventana_titulo, semilla=42):
+    pares = [(i, l) for i, l in rutas(split) if l.exists() and l.read_text().strip()]
+    random.Random(semilla).shuffle(pares)
+    muestras = pares[:12]
+
+    fig, axes = plt.subplots(3, 4, figsize=(15, 10))
+    fig.canvas.manager.set_window_title(ventana_titulo)
+    axes = axes.ravel()
+
+    for ax in axes:
+        ax.axis("off")
+
+    for ax, (img_p, lbl_p) in zip(axes, muestras):
+        ax.imshow(dibujar_identificacion(img_p, lbl_p))
+        ax.set_title(img_p.name[:20], fontsize=8)
+
+    fig.suptitle(titulo, fontsize=13)
+    fig.tight_layout()
+    plt.show()
+
+mostrar_galeria_split("train", "12 Muestras de Entrenamiento (Train)", "Galeria - TRAIN")
+mostrar_galeria_split("val", "12 Muestras de Validacion (Val)", "Galeria - VAL")
+mostrar_galeria_split("test", "12 Muestras de Prueba (Test)", "Galeria - TEST")
+
+def asociar(et):
+    screws = [p for c, p in et if c == idx_screw]
+    asig = [[] for _ in screws]
+    if not screws:
+        return screws, asig
+    for c, p in et:
+        if c == idx_screw:
+            continue
+        cx, cy = map(float, p.mean(axis=0))
+        dists = [cv2.pointPolygonTest(s.reshape(-1, 1, 2).astype(np.float32), (cx, cy), True) for s in screws]
+        i = int(np.argmax(dists))
+        asig[i].append((c, p, dists[i]))
+    return screws, asig
+
+def recorte(img, poly, margen=0.15):
+    x, y, bw, bh = cv2.boundingRect(poly)
+    mx, my = int(bw * margen), int(bh * margen)
+    x0, y0 = max(0, x - mx), max(0, y - my)
+    x1, y1 = min(img.shape[1], x + bw + mx), min(img.shape[0], y + bh + my)
+    return img[y0:y1, x0:x1]
+
+def procesar_split(split):
+    X_imgs, y_labels = [], []
+    for img_p, lbl_p in rutas(split):
+        if not lbl_p.exists():
+            continue
+        img = cv2.imread(str(img_p))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        et = leer_etiquetas(lbl_p, w, h)
+        screws, asig = asociar(et)
+        
+        for i, s_poly in enumerate(screws):
+            L = max(cv2.boundingRect(s_poly)[2:])
+            n_def = sum(1 for c, p, d in asig[i] if d >= -TOL_FRAC * L)
+            label = 1 if n_def > 0 else 0
+            
+            crop = recorte(img, s_poly, margen=0.1)
+            if crop.size == 0 or crop.shape[0] < 12 or crop.shape[1] < 12:
+                continue
+            
+            crop_res = cv2.resize(crop, IMG_SIZE)
+            crop_rgb = cv2.cvtColor(crop_res, cv2.COLOR_BGR2RGB)
+            X_imgs.append(crop_rgb)
+            y_labels.append(label)
+    return np.array(X_imgs), np.array(y_labels)
+
+X_tr_raw, y_train = procesar_split("train")
+X_va_raw, y_val   = procesar_split("val")
+X_te_raw, y_test  = procesar_split("test")
+
+
+#Extraccion de caracteristicas (HOG, LBP Y Fusion)
+
+def extraer_hog(imgs):
+    feats = []
+    for img in imgs:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        f = hog(gray, orientations=9, pixels_per_cell=(8, 8),
+                cells_per_block=(2, 2), block_norm='L2-Hys', visualize=False)
+        feats.append(f)
+    return np.array(feats, dtype=np.float32)
+
+def extraer_lbp(imgs, P=8, R=1):
+    feats = []
+    for img in imgs:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        lbp = local_binary_pattern(gray, P=P, R=R, method="uniform")
+        hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, P + 3), range=(0, P + 2))
+        hist = hist.astype("float32")
+        hist /= (hist.sum() + 1e-7)
+        feats.append(hist)
+    return np.array(feats, dtype=np.float32)
+
+descriptores = {}
+splits = [("train", X_tr_raw), ("val", X_va_raw), ("test", X_te_raw)]
+
+for nombre_split, imgs in splits:
+    f_hog = extraer_hog(imgs)
+    f_lbp = extraer_lbp(imgs)
+    f_fusion = np.hstack([f_hog, f_lbp])
+    descriptores[nombre_split] = {
+        'HOG': f_hog,
+        'LBP': f_lbp,
+        'FUSIÓN': f_fusion
+    }
+
+
+# Normalizacion (Z-SCORE)
+# Clasificacion (k-NN, SVM, RANDOM FOREST) 
+
+clasificadores = {
+    'k-NN (k=5)': KNeighborsClassifier(n_neighbors=5, metric='euclidean'),
+    'SVM (RBF)': SVC(kernel='rbf', C=1.0, probability=True, random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+}
+
+nombres_descriptores = ['HOG', 'LBP', 'FUSIÓN']
+nombres_modelos = list(clasificadores.keys())
+
+f1_matriz = np.zeros((len(nombres_descriptores), len(nombres_modelos)))
+fps_matriz = np.zeros((len(nombres_descriptores), len(nombres_modelos)))
+costo_matriz = np.zeros((len(nombres_descriptores), len(nombres_modelos)))
+pipelines_guardados = {}
+
+COSTO_FN_ESCAPE = 60000.0   # COP por pieza defectuosa enviada a línea
+COSTO_FP_RECHAZO = 200.0    # COP por pieza sana descartada (scrap)
+
+mejor_f1_val = -1.0
+mejor_config = None
+
+header = f"{'Descriptor':<10} {'Modelo':<15} {'F1 (Val)':<10} {'Acc (Test)':<12} {'Prec (Test)':<13} {'Rec (Test)':<12} {'F1 (Test)':<11} {'FPS':<8} {'Costo Test ($COP)':<18}"
+print("\n" + header)
+print("-" * len(header))
+
+for i, desc_name in enumerate(nombres_descriptores):
+    X_tr = descriptores['train'][desc_name]
+    X_va = descriptores['val'][desc_name]
+    X_te = descriptores['test'][desc_name]
+    
+    for j, (mod_name, clf) in enumerate(clasificadores.items()):
+        pipeline = Pipeline([
+            ('normalizacion_zscore', StandardScaler()),
+            ('clasificador', clf)
+        ])
+        
+        pipeline.fit(X_tr, y_train)
+        
+        y_val_pred = pipeline.predict(X_va)
+        f1_val = f1_score(y_val, y_val_pred, average='binary', zero_division=0)
+        
+        t0 = time.time()
+        y_pred = pipeline.predict(X_te)
+        t_inf_total = time.time() - t0
+        fps = len(X_te) / (t_inf_total + 1e-7)
+        
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, average='binary', zero_division=0)
+        rec = recall_score(y_test, y_pred, average='binary', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='binary', zero_division=0)
+        
+        cm = confusion_matrix(y_test, y_pred)
+        tn, fp, fn, tp = cm.ravel()
+        costo_total = (fn * COSTO_FN_ESCAPE) + (fp * COSTO_FP_RECHAZO)
+        
+        f1_matriz[i, j] = f1
+        fps_matriz[i, j] = fps
+        costo_matriz[i, j] = costo_total
+        pipelines_guardados[(desc_name, mod_name)] = (pipeline, y_pred, cm, fps, costo_total, f1_val)
+        
+        print(f"{desc_name:<10} {mod_name:<15} {f1_val:<10.3f} {acc:<12.3f} {prec:<13.3f} {rec:<12.3f} {f1:<11.3f} {fps:<8.1f} ${costo_total:<17,.0f}")
+        
+        if f1_val > mejor_f1_val:
+            mejor_f1_val = f1_val
+            mejor_config = (desc_name, mod_name)
+
+fig_metricas, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+fig_metricas.canvas.manager.set_window_title("Resultados Comparativos de Modelos")
+ancho_barra = 0.25
+indices = np.arange(len(nombres_descriptores))
+colores = ['#4c72b0', '#55a868', '#c44e52']
+
+for j, mod_name in enumerate(nombres_modelos):
+    pos = indices + (j - 1) * ancho_barra
+    ax1.bar(pos, f1_matriz[:, j], ancho_barra, label=mod_name, color=colores[j], edgecolor='black')
+    ax2.bar(pos, costo_matriz[:, j], ancho_barra, label=mod_name, color=colores[j], edgecolor='black')
+
+ax1.set_title("Desempeño Técnico: F1-Score (Test Set)")
+ax1.set_ylabel("F1-Score")
+ax1.set_xticks(indices)
+ax1.set_xticklabels(nombres_descriptores)
+ax1.set_ylim(0, 1.05)
+ax1.grid(axis='y', linestyle='--', alpha=0.6)
+ax1.legend(loc='lower right')
+
+ax2.set_title("Métrica de Negocio: Costo por Errores de Calidad (COP)")
+ax2.set_ylabel("Costo Total Estimado ($ COP)")
+ax2.set_xticks(indices)
+ax2.set_xticklabels(nombres_descriptores)
+ax2.grid(axis='y', linestyle='--', alpha=0.6)
+ax2.legend(loc='upper right')
+
+fig_metricas.tight_layout()
+plt.show()
+
+mejor_desc, mejor_mod = mejor_config
+pipe_opt, y_pred_opt, cm_opt, fps_opt, costo_opt, f1_val_opt = pipelines_guardados[(mejor_desc, mejor_mod)]
+tn, fp, fn, tp = cm_opt.ravel()
+recall_opt = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+piezas_hora_sistema = fps_opt * 3600
+costo_manual_escape = int(len(y_test) * 0.15 * COSTO_FN_ESCAPE)
+
+fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
+fig_cm.canvas.manager.set_window_title("Matriz de Confusion Final")
+disp = ConfusionMatrixDisplay(confusion_matrix=cm_opt, display_labels=["Sano (0)", "Defectuoso (1)"])
+disp.plot(cmap=plt.cm.Blues, values_format='d', ax=ax_cm)
+ax_cm.set_title(f"Matriz de Confusión: {mejor_mod} + {mejor_desc}")
+ax_cm.grid(False)
+fig_cm.tight_layout()
+plt.show()
